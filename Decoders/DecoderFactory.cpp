@@ -37,6 +37,7 @@
 /* Add your decoder's include file below. */
 #include "Decoders/DRCDecoder/DRCDecoder.h"
 #include "Decoders/Migrator/Migrator.h"
+#include "Decoders/ReRAMRegionMapper/ReRAMRegionMapper.h"
 
 using namespace NVM;
 
@@ -47,6 +48,7 @@ AddressTranslator *DecoderFactory::CreateDecoder( std::string decoder )
     if( decoder == "Default" ) trans = new AddressTranslator( );
     else if( decoder == "DRCDecoder" ) trans = new DRCDecoder( );
     else if( decoder == "Migrator" ) trans = new Migrator( );
+    else if( decoder == "ReRAMRegionMapper" ) trans = new ReRAMRegionMapper( );
 
     return trans;
 }

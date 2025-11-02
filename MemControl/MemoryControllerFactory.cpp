@@ -40,6 +40,7 @@
 #include "MemControl/LH-Cache/LH-Cache.h"
 #include "MemControl/LO-Cache/LO-Cache.h"
 #include "MemControl/PredictorDRC/PredictorDRC.h"
+#include "MemControl/ReRAMRegionController/ReRAMRegionController.h"
 
 #include <iostream>
 
@@ -68,6 +69,8 @@ MemoryController *MemoryControllerFactory::CreateNewController( std::string cont
         memoryController = new LO_Cache( );
     else if( controller == "PredictorDRC" )
         memoryController = new PredictorDRC( );
+    else if( controller == "ReRAMRegionController" )
+        memoryController = new ReRAMRegionController( );
 
     if( memoryController == NULL )
         std::cout << "NVMain: Unknown memory controller `" 

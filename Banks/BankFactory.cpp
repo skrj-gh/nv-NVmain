@@ -37,6 +37,7 @@
 /* Add your decoder's include file below. */
 #include "Banks/DDR3Bank/DDR3Bank.h"
 #include "Banks/CachedDDR3Bank/CachedDDR3Bank.h"
+#include "Banks/ReRAMBank/ReRAMBank.h"
 
 using namespace NVM;
 
@@ -46,6 +47,7 @@ Bank *BankFactory::CreateBank( std::string bankName )
 
     if( bankName == "DDR3" ) bank = new DDR3Bank( );
     else if( bankName == "CachedDDR3" ) bank = new CachedDDR3Bank( );
+    else if( bankName == "ReRAMBank" ) bank = new ReRAMBank( );
     //else if( bankName == "LPDDR2" ) bank = new LPDDR2Bank( );
     //else if( bankName == "LPDDR2-N" ) bank = new LPDDR2NBank( );
 

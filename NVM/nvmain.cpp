@@ -45,6 +45,8 @@
 #include "include/NVMainRequest.h"
 #include "include/NVMHelpers.h"
 #include "Prefetchers/PrefetcherFactory.h"
+#include "MemControl/ReRAMRegionController/ReRAMRegionController.h"
+#include "Decoders/ReRAMRegionMapper/ReRAMRegionMapper.h"
 
 #include <sstream>
 #include <cassert>
@@ -215,6 +217,25 @@ void NVMain::SetConfig( Config *conf, std::string memoryName, bool createChildre
 
             /* Register statistics. */
             memoryControllers[i]->RegisterStats( );
+        }
+
+        /* Link ReRAMRegionController to ReRAMRegionMapper if both are being used */
+        ReRAMRegionMapper* reramMapper = dynamic_cast<ReRAMRegionMapper*>(translator);
+
+        if (reramMapper != NULL) {
+            std::cout << "NVMain: Detected ReRAMRegionMapper - linking to controllers..." << std::endl;
+
+            /* Link each controller to the mapper for region swapping */
+            for (unsigned int i = 0; i < numChannels; i++) {
+                ReRAMRegionController* reramCtrl =
+                    dynamic_cast<ReRAMRegionController*>(memoryControllers[i]);
+
+                if (reramCtrl != NULL) {
+                    reramCtrl->SetRegionMapper(reramMapper);
+                    std::cout << "  Linked ReRAMRegionController to ReRAMRegionMapper for channel "
+                              << i << std::endl;
+                }
+            }
         }
 
     }
