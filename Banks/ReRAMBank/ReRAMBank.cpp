@@ -139,37 +139,26 @@ bool ReRAMBank::Write(NVMainRequest *request)
     // Determine if this is a fast or slow region
     bool isFast = IsFastRegion(PRA);
 
-    // Select appropriate latency
-    ncycle_t writeLatency;
+    // Update statistics
     if (isFast) {
-        writeLatency = NanoToCycles(fastRegionLatency);
         fastRegionWrites++;
         totalFastWriteLatency += fastRegionLatency;
     } else {
-        writeLatency = NanoToCycles(slowRegionLatency);
         slowRegionWrites++;
         totalSlowWriteLatency += slowRegionLatency;
     }
 
     // Call parent Write method
+    // Note: The actual latency is handled in NextIssuable() method
+    // which the memory controller uses for scheduling
     bool success = DDR3Bank::Write(request);
-
-    if (success) {
-        // Adjust timing for next operation based on region latency
-        // Note: This is a simplified model. In reality, we'd need to modify
-        // the timing parameters more carefully in SetConfig or use a custom
-        // timing model.
-        nextWrite = GetEventQueue()->GetCurrentCycle() + writeLatency;
-        nextRead = GetEventQueue()->GetCurrentCycle() + writeLatency;
-    }
 
     #ifdef DEBUG_RERAM_BANK
     if (success) {
         std::cout << "ReRAMBank Write: PRA=" << PRA
                   << ", region=" << ((PRA >> 6) & 0xF)
                   << ", fast=" << isFast
-                  << ", latency=" << writeLatency << " cycles ("
-                  << (isFast ? fastRegionLatency : slowRegionLatency) << " ns)"
+                  << ", latency=" << (isFast ? fastRegionLatency : slowRegionLatency) << " ns"
                   << std::endl;
     }
     #endif
@@ -202,21 +191,21 @@ ncycle_t ReRAMBank::NextIssuable(NVMainRequest *request)
     // Get base next issuable time from parent
     ncycle_t baseIssuable = DDR3Bank::NextIssuable(request);
 
-    // For write operations, potentially adjust based on region latency
+    // For write operations, add variable latency based on region
+    // Note: This is a simplified approach. In a more accurate model,
+    // we would modify the timing parameters (tWR, etc.) in SetConfig
+    // based on the region being accessed.
     OpType op = request->type;
     if (op == WRITE || op == WRITE_PRECHARGE) {
         uint64_t PRA = request->address.GetRow();
         bool isFast = IsFastRegion(PRA);
 
-        // Calculate latency-aware next issuable time
-        ncycle_t latency = isFast ? NanoToCycles(fastRegionLatency)
-                                   : NanoToCycles(slowRegionLatency);
-
-        ncycle_t currentCycle = GetEventQueue()->GetCurrentCycle();
-        ncycle_t latencyAwareIssuable = currentCycle + latency;
-
-        // Return maximum of base issuable and latency-aware time
-        return std::max(baseIssuable, latencyAwareIssuable);
+        // Add additional cycles for slow regions
+        // Fast regions use baseline timing, slow regions add delay
+        if (!isFast) {
+            ncycle_t extraLatency = NanoToCycles(slowRegionLatency - fastRegionLatency);
+            return baseIssuable + extraLatency;
+        }
     }
 
     return baseIssuable;
