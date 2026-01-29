@@ -30,6 +30,7 @@
 *******************************************************************************/
 
 #include "Banks/ReRAMBank/ReRAMBank.h"
+#include "src/MemoryController.h"
 #include "src/EventQueue.h"
 #include <iostream>
 #include <cmath>
