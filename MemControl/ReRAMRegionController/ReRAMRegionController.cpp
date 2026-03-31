@@ -104,10 +104,10 @@ void ReRAMRegionController::SetConfig(Config *conf, bool createChildren)
         fastRegionsPerMat = conf->GetValue("FastRegionsPerMat");
 
     if (conf->KeyExists("Alpha"))
-        alpha = conf->GetValue("Alpha");
+        alpha = conf->GetEnergy("Alpha");
 
     if (conf->KeyExists("Beta"))
-        beta = conf->GetValue("Beta");
+        beta = conf->GetEnergy("Beta");
 
     if (conf->KeyExists("EpochLength"))
         epochLength = conf->GetValue("EpochLength");

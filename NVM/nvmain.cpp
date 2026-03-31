@@ -224,17 +224,44 @@ void NVMain::SetConfig( Config *conf, std::string memoryName, bool createChildre
 
         if (reramMapper != NULL) {
             std::cout << "NVMain: Detected ReRAMRegionMapper - linking to controllers..." << std::endl;
+            
+            int linkedCount = 0;
 
-            /* Link each controller to the mapper for region swapping */
+            /* Iterate through channels to find the actual per-channel controllers */
             for (unsigned int i = 0; i < numChannels; i++) {
-                ReRAMRegionController* reramCtrl =
-                    dynamic_cast<ReRAMRegionController*>(memoryControllers[i]);
-
-                if (reramCtrl != NULL) {
-                    reramCtrl->SetRegionMapper(reramMapper);
-                    std::cout << "  Linked ReRAMRegionController to ReRAMRegionMapper for channel "
-                              << i << std::endl;
+                /* Get the children of the top-level controller */
+                std::vector<NVMObject_hook *>& childHooks = memoryControllers[i]->GetChildren();
+                
+                /* Search through children for ReRAMRegionController */
+                bool foundForChannel = false;
+                for (std::vector<NVMObject_hook *>::iterator hookIt = childHooks.begin(); 
+                     hookIt != childHooks.end(); ++hookIt) {
+                    NVMObject *childObj = (*hookIt)->GetTrampoline();
+                    ReRAMRegionController* reramCtrl = 
+                        dynamic_cast<ReRAMRegionController*>(childObj);
+                    
+                    if (reramCtrl != NULL) {
+                        reramCtrl->SetRegionMapper(reramMapper);
+                        std::cout << "  Linked ReRAMRegionController to ReRAMRegionMapper "
+                                  << "for channel " << i << std::endl;
+                        linkedCount++;
+                        foundForChannel = true;
+                        break;  /* Found controller for this channel */
+                    }
                 }
+                
+                if (!foundForChannel) {
+                    std::cerr << "  WARNING: channel " << i 
+                              << " does not contain a ReRAMRegionController" << std::endl;
+                }
+            }
+            
+            if (linkedCount == 0) {
+                std::cerr << "NVMain ERROR: ReRAMRegionMapper detected but no "
+                          << "ReRAMRegionController found to link it to!" << std::endl;
+            } else {
+                std::cout << "NVMain: Successfully linked " << linkedCount 
+                          << " ReRAMRegionController(s) to ReRAMRegionMapper" << std::endl;
             }
         }
 
