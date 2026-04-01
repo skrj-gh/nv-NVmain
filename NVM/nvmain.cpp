@@ -227,26 +227,38 @@ void NVMain::SetConfig( Config *conf, std::string memoryName, bool createChildre
             
             int linkedCount = 0;
 
-            /* Iterate through channels to find the actual per-channel controllers */
-            for (unsigned int i = 0; i < numChannels; i++) {
-                /* Get the children of the top-level controller */
-                std::vector<NVMObject_hook *>& childHooks = memoryControllers[i]->GetChildren();
-                
-                /* Search through children for ReRAMRegionController */
+            /* Use local 'channels' variable (initialized) not 'numChannels' member (uninitialized) */
+            for (unsigned int i = 0; i < channels; i++) {  /* FIXED: 'channels' not 'numChannels' */
                 bool foundForChannel = false;
-                for (std::vector<NVMObject_hook *>::iterator hookIt = childHooks.begin(); 
-                     hookIt != childHooks.end(); ++hookIt) {
-                    NVMObject *childObj = (*hookIt)->GetTrampoline();
-                    ReRAMRegionController* reramCtrl = 
-                        dynamic_cast<ReRAMRegionController*>(childObj);
+                
+                /* Try direct cast first (ReRAMRegionController IS-A FRFCFS) */
+                ReRAMRegionController* reramCtrl = 
+                    dynamic_cast<ReRAMRegionController*>(memoryControllers[i]);
+                
+                if (reramCtrl != NULL) {
+                    reramCtrl->SetRegionMapper(reramMapper);
+                    std::cout << "  Linked ReRAMRegionController to ReRAMRegionMapper "
+                              << "for channel " << i << std::endl;
+                    linkedCount++;
+                    foundForChannel = true;
+                } else {
+                    /* Fallback: Search in children if wrapped by another controller */
+                    std::vector<NVMObject_hook *>& childHooks = memoryControllers[i]->GetChildren();
                     
-                    if (reramCtrl != NULL) {
-                        reramCtrl->SetRegionMapper(reramMapper);
-                        std::cout << "  Linked ReRAMRegionController to ReRAMRegionMapper "
-                                  << "for channel " << i << std::endl;
-                        linkedCount++;
-                        foundForChannel = true;
-                        break;  /* Found controller for this channel */
+                    for (std::vector<NVMObject_hook *>::iterator hookIt = childHooks.begin(); 
+                         hookIt != childHooks.end(); ++hookIt) {
+                        NVMObject *childObj = (*hookIt)->GetTrampoline();
+                        ReRAMRegionController* childCtrl = 
+                            dynamic_cast<ReRAMRegionController*>(childObj);
+                        
+                        if (childCtrl != NULL) {
+                            childCtrl->SetRegionMapper(reramMapper);
+                            std::cout << "  Linked ReRAMRegionController to ReRAMRegionMapper "
+                                      << "for channel " << i << " (via child)" << std::endl;
+                            linkedCount++;
+                            foundForChannel = true;
+                            break;
+                        }
                     }
                 }
                 
