@@ -42,21 +42,32 @@ ReRAMRegionController::ReRAMRegionController()
 {
     regionMapper = NULL;
 
-    // Default configuration values
     alpha = 0.5;
     beta = 0.5;
-    epochLength = 1000000;  // 1M cycles
+    epochLength = 1000000;
     migrationThreshold = 100.0;
+    enableInterBankMigration = true;
+    interBankMigrationThreshold = 180.0;
+    interBankMigrationCost = 80.0;
+    interBankScoreWeight = 0.8;
+    intraBankScoreWeight = 1.0;
+    maxInterBankMigrationsPerEpoch = 1;
+    maxTotalMigrationsPerEpoch = 2;
+    interBankCooldownEpochs = 2;
+    preferIntraBankOnTie = true;
+    allowCrossRankMigration = false;
+    allowCrossChannelMigration = false;
+
+    numChannels = 2;
+    numRanks = 2;
     numBanks = 8;
     numRegionsPerBank = 1024;
     numRegionsPerMat = 16;
     fastRegionsPerMat = 4;
 
-    // Initialize cycle tracking
     currentCycle = 0;
     lastEpochCycle = 0;
 
-    // Initialize statistics
     totalMigrations = 0;
     totalEpochs = 0;
     for (int i = 0; i < 8; i++) {
@@ -64,6 +75,11 @@ ReRAMRegionController::ReRAMRegionController()
     }
     hotAccessesToFast = 0;
     hotAccessesToSlow = 0;
+    totalInterBankMigrations = 0;
+    totalIntraBankMigrations = 0;
+    interBankMigrationAttempts = 0;
+    interBankMigrationRejects = 0;
+    cooldownBlockedMigrations = 0;
     avgScoreDifference = 0.0;
     maxScoreDifference = 0.0;
 }
@@ -73,14 +89,19 @@ ReRAMRegionController::~ReRAMRegionController()
     writeScores.clear();
     readScores.clear();
     regionScores.clear();
+    lastMigrationEpoch.clear();
 }
 
 void ReRAMRegionController::SetConfig(Config *conf, bool createChildren)
 {
-    // Call parent SetConfig first
     FRFCFS::SetConfig(conf, createChildren);
 
-    // Read configuration parameters
+    if (conf->KeyExists("CHANNELS"))
+        numChannels = conf->GetValue("CHANNELS");
+
+    if (conf->KeyExists("RANKS"))
+        numRanks = conf->GetValue("RANKS");
+
     if (conf->KeyExists("BANKS"))
         numBanks = conf->GetValue("BANKS");
 
@@ -115,18 +136,61 @@ void ReRAMRegionController::SetConfig(Config *conf, bool createChildren)
     if (conf->KeyExists("MigrationThreshold"))
         migrationThreshold = conf->GetValue("MigrationThreshold");
 
-    // Validation
+    if (conf->KeyExists("EnableInterBankMigration"))
+        enableInterBankMigration = conf->GetBool("EnableInterBankMigration");
+
+    if (conf->KeyExists("InterBankMigrationThreshold"))
+        interBankMigrationThreshold = conf->GetValue("InterBankMigrationThreshold");
+
+    if (conf->KeyExists("InterBankMigrationCost"))
+        interBankMigrationCost = conf->GetValue("InterBankMigrationCost");
+
+    if (conf->KeyExists("InterBankScoreWeight"))
+        interBankScoreWeight = conf->GetEnergy("InterBankScoreWeight");
+
+    if (conf->KeyExists("IntraBankScoreWeight"))
+        intraBankScoreWeight = conf->GetEnergy("IntraBankScoreWeight");
+
+    if (conf->KeyExists("MaxInterBankMigrationsPerEpoch"))
+        maxInterBankMigrationsPerEpoch = conf->GetValue("MaxInterBankMigrationsPerEpoch");
+
+    if (conf->KeyExists("MaxTotalMigrationsPerEpoch"))
+        maxTotalMigrationsPerEpoch = conf->GetValue("MaxTotalMigrationsPerEpoch");
+
+    if (conf->KeyExists("InterBankCooldownEpochs"))
+        interBankCooldownEpochs = conf->GetValue("InterBankCooldownEpochs");
+
+    if (conf->KeyExists("PreferIntraBankOnTie"))
+        preferIntraBankOnTie = conf->GetBool("PreferIntraBankOnTie");
+
+    if (conf->KeyExists("AllowCrossRankMigration"))
+        allowCrossRankMigration = conf->GetBool("AllowCrossRankMigration");
+
+    if (conf->KeyExists("AllowCrossChannelMigration"))
+        allowCrossChannelMigration = conf->GetBool("AllowCrossChannelMigration");
+
     assert(alpha + beta > 0.0 && "Alpha + Beta must be positive");
     assert(epochLength > 0 && "EpochLength must be positive");
     assert(migrationThreshold >= 0.0 && "MigrationThreshold must be non-negative");
+    assert(!allowCrossRankMigration &&
+           "Cross-rank migration is not supported in this implementation");
+    assert(!allowCrossChannelMigration &&
+           "Cross-channel migration is not supported in this implementation");
 
-    // Print configuration
     std::cout << "ReRAMRegionController Configuration:" << std::endl;
     std::cout << "  Alpha (write weight): " << alpha << std::endl;
     std::cout << "  Beta (read weight): " << beta << std::endl;
     std::cout << "  Epoch length: " << epochLength << " cycles" << std::endl;
     std::cout << "  Migration threshold: " << migrationThreshold << std::endl;
-    std::cout << "  Banks: " << numBanks << std::endl;
+    std::cout << "  Interbank migration enabled: " << enableInterBankMigration << std::endl;
+    std::cout << "  Interbank migration threshold: " << interBankMigrationThreshold << std::endl;
+    std::cout << "  Interbank migration cost: " << interBankMigrationCost << std::endl;
+    std::cout << "  Interbank cooldown epochs: " << interBankCooldownEpochs << std::endl;
+    std::cout << "  Allow cross-rank migration: " << allowCrossRankMigration << std::endl;
+    std::cout << "  Allow cross-channel migration: " << allowCrossChannelMigration << std::endl;
+    std::cout << "  Channels: " << numChannels << std::endl;
+    std::cout << "  Ranks per channel: " << numRanks << std::endl;
+    std::cout << "  Banks per rank: " << numBanks << std::endl;
     std::cout << "  Regions per bank: " << numRegionsPerBank << std::endl;
     std::cout << "  Fast regions per mat: " << fastRegionsPerMat
               << " / " << numRegionsPerMat << std::endl;
@@ -141,10 +205,8 @@ void ReRAMRegionController::SetRegionMapper(ReRAMRegionMapper *mapper)
 
 bool ReRAMRegionController::IssueCommand(NVMainRequest *req)
 {
-    // Call parent IssueCommand first
     bool issued = FRFCFS::IssueCommand(req);
 
-    // If command was successfully issued, update region scores
     if (issued) {
         UpdateRegionScores(req);
     }
@@ -154,26 +216,20 @@ bool ReRAMRegionController::IssueCommand(NVMainRequest *req)
 
 void ReRAMRegionController::UpdateRegionScores(NVMainRequest *req)
 {
-    // Skip if region mapper not set
     if (regionMapper == NULL) {
         return;
     }
 
-    // Extract address components
     NVMAddress &addr = req->address;
-    uint64_t bank = addr.GetBank();
-    uint64_t PRA = addr.GetRow();  // This is Physical Row Address (already translated)
+    uint64_t physChannel = addr.GetChannel();
+    uint64_t physRank = addr.GetRank();
+    uint64_t physBank = addr.GetBank();
+    uint64_t PRA = addr.GetRow();
+    uint64_t PRN = PRA >> 6;
 
-    // Extract PRN from PRA
-    uint64_t PRN = PRA >> 6;  // Top 10 bits of PRA
+    VirtualRegionLoc owner = regionMapper->GetVirtualOwner(physChannel, physRank, physBank, PRN);
+    uint64_t key = MakeKey(owner.channel, owner.rank, owner.bank, owner.vrn);
 
-    // Use inverse region table to get original VRN
-    uint64_t VRN = regionMapper->GetVRNFromPRN(bank, PRN);
-
-    // Generate key for score tracking
-    uint64_t key = MakeKey(bank, VRN);
-
-    // Update appropriate score based on operation type
     OpType op = req->type;
     if (op == WRITE || op == WRITE_PRECHARGE) {
         writeScores[key]++;
@@ -181,14 +237,9 @@ void ReRAMRegionController::UpdateRegionScores(NVMainRequest *req)
         readScores[key]++;
     }
 
-    // Track hot region effectiveness
-    // Calculate combined score for this VRN
     double score = alpha * writeScores[key] + beta * readScores[key];
-
-    // Check if this is a hot region (score > average)
-    // and whether it's accessing fast or slow physical region
-    bool isFast = regionMapper->IsFastRegion(PRN);
-    if (score > migrationThreshold) {  // Simple heuristic for "hot"
+    bool isFast = regionMapper->IsFastRegion(physChannel, physRank, physBank, PRN);
+    if (score > migrationThreshold) {
         if (isFast) {
             hotAccessesToFast++;
         } else {
@@ -199,191 +250,330 @@ void ReRAMRegionController::UpdateRegionScores(NVMainRequest *req)
 
 void ReRAMRegionController::Cycle(ncycle_t steps)
 {
-    // Update cycle counter
     currentCycle += steps;
-
-    // Call parent Cycle for normal FRFCFS scheduling
     FRFCFS::Cycle(steps);
 
-    // Check if epoch has ended
     if (currentCycle - lastEpochCycle >= epochLength) {
         totalEpochs++;
 
-        // Trigger migration for each bank
-        for (uint64_t bank = 0; bank < numBanks; bank++) {
-            Migration(bank);
+        uint64_t totalUsed = 0;
+        uint64_t interbankUsed = 0;
+        uint64_t channel = GetID();
+
+        for (uint64_t rank = 0; rank < numRanks; rank++) {
+            for (uint64_t bank = 0; bank < numBanks; bank++) {
+                if (totalUsed >= maxTotalMigrationsPerEpoch) {
+                    break;
+                }
+                Migration(channel, rank, bank, totalUsed, interbankUsed);
+            }
         }
 
-        // Update epoch timestamp
         lastEpochCycle = currentCycle;
-
-        #ifdef DEBUG_REGION_CONTROLLER
-        std::cout << "ReRAMRegionController: Epoch " << totalEpochs
-                  << " completed at cycle " << currentCycle << std::endl;
-        std::cout << "  Total migrations: " << totalMigrations << std::endl;
-        std::cout << "  Hot→Fast: " << hotAccessesToFast
-                  << ", Hot→Slow: " << hotAccessesToSlow << std::endl;
-        #endif
     }
 }
 
-void ReRAMRegionController::CalculateRegionScores(uint64_t bank)
+void ReRAMRegionController::CalculateRegionScores(uint64_t channel, uint64_t rank, uint64_t bank)
 {
-    // Calculate combined score S = α*WS + β*RS for all regions in bank
     for (uint64_t VRN = 0; VRN < numRegionsPerBank; VRN++) {
-        uint64_t key = MakeKey(bank, VRN);
-
-        uint64_t WS = writeScores[key];  // Defaults to 0 if not in map
-        uint64_t RS = readScores[key];   // Defaults to 0 if not in map
-
-        double score = alpha * WS + beta * RS;
-        regionScores[key] = score;
+        uint64_t key = MakeKey(channel, rank, bank, VRN);
+        uint64_t WS = writeScores[key];
+        uint64_t RS = readScores[key];
+        regionScores[key] = alpha * WS + beta * RS;
     }
 }
 
-bool ReRAMRegionController::CheckMigrationThreshold(uint64_t bank,
-                                                     uint64_t &VRN_max,
-                                                     uint64_t &VRN_min)
+bool ReRAMRegionController::IsCoolingDown(const VirtualRegionLoc& loc) const
 {
-    // Find VRN with maximum and minimum scores
-    double maxScore = -1.0;
-    double minScore = std::numeric_limits<double>::max();
+    if (interBankCooldownEpochs == 0) {
+        return false;
+    }
 
-    VRN_max = 0;
-    VRN_min = 0;
+    uint64_t key = MakeKey(loc.channel, loc.rank, loc.bank, loc.vrn);
+    std::map<uint64_t, uint64_t>::const_iterator it = lastMigrationEpoch.find(key);
+
+    if (it == lastMigrationEpoch.end()) {
+        return false;
+    }
+
+    return (totalEpochs - it->second) < interBankCooldownEpochs;
+}
+
+bool ReRAMRegionController::FindHotSlowRegion(uint64_t channel, uint64_t rank, uint64_t bank,
+                                              VirtualRegionLoc& hotVirt,
+                                              PhysicalRegionLoc& hotPhys,
+                                              double& hotScore)
+{
+    hotScore = -1.0;
+    bool found = false;
 
     for (uint64_t VRN = 0; VRN < numRegionsPerBank; VRN++) {
-        uint64_t key = MakeKey(bank, VRN);
+        VirtualRegionLoc virt;
+        virt.channel = channel;
+        virt.rank = rank;
+        virt.bank = bank;
+        virt.vrn = VRN;
+
+        if (IsCoolingDown(virt)) {
+            cooldownBlockedMigrations++;
+            continue;
+        }
+
+        uint64_t key = MakeKey(channel, rank, bank, VRN);
         double score = regionScores[key];
+        PhysicalRegionLoc phys = regionMapper->GetPhysicalLocation(channel, rank, bank, VRN);
 
-        if (score > maxScore) {
-            maxScore = score;
-            VRN_max = VRN;
+        if (regionMapper->IsFastRegion(phys)) {
+            continue;
         }
-        if (score < minScore) {
-            minScore = score;
-            VRN_min = VRN;
-        }
-    }
 
-    // Calculate score difference
-    double scoreDiff = maxScore - minScore;
-
-    // Update statistics
-    if (scoreDiff > maxScoreDifference) {
-        maxScoreDifference = scoreDiff;
-    }
-    avgScoreDifference = (avgScoreDifference * totalMigrations + scoreDiff) /
-                         (totalMigrations + 1);
-
-    // Check threshold
-    if (scoreDiff < migrationThreshold) {
-        return false;  // Not enough difference to warrant migration
-    }
-
-    // Check if hot region is already in fast physical region
-    if (regionMapper != NULL) {
-        uint64_t PRN_max = regionMapper->GetPRN(bank, VRN_max);
-        if (regionMapper->IsFastRegion(PRN_max)) {
-            return false;  // Already optimally placed
+        if (score > hotScore) {
+            hotVirt = virt;
+            hotPhys = phys;
+            hotScore = score;
+            found = true;
         }
     }
 
-    return true;  // Migration should be performed
+    return found;
 }
 
-void ReRAMRegionController::Migration(uint64_t bank)
+bool ReRAMRegionController::FindColdFastRegionInBank(uint64_t channel, uint64_t rank, uint64_t bank,
+                                                      const PhysicalRegionLoc& sourcePhys,
+                                                      VirtualRegionLoc& victimVirt,
+                                                      PhysicalRegionLoc& victimPhys,
+                                                      double& coldScore)
 {
-    // Skip if region mapper not set
+    (void)sourcePhys;
+    coldScore = std::numeric_limits<double>::max();
+    bool found = false;
+
+    for (uint64_t VRN = 0; VRN < numRegionsPerBank; VRN++) {
+        VirtualRegionLoc virt;
+        virt.channel = channel;
+        virt.rank = rank;
+        virt.bank = bank;
+        virt.vrn = VRN;
+
+        if (IsCoolingDown(virt)) {
+            continue;
+        }
+
+        PhysicalRegionLoc phys = regionMapper->GetPhysicalLocation(channel, rank, bank, VRN);
+        if (!regionMapper->IsFastRegion(phys)) {
+            continue;
+        }
+
+        uint64_t key = MakeKey(channel, rank, bank, VRN);
+        double score = regionScores[key];
+        if (score < coldScore) {
+            victimVirt = virt;
+            victimPhys = phys;
+            coldScore = score;
+            found = true;
+        }
+    }
+
+    return found;
+}
+
+bool ReRAMRegionController::FindColdFastRegionInRank(uint64_t channel, uint64_t rank,
+                                                      uint64_t sourceBank,
+                                                      const PhysicalRegionLoc& sourcePhys,
+                                                      VirtualRegionLoc& victimVirt,
+                                                      PhysicalRegionLoc& victimPhys,
+                                                      double& coldScore)
+{
+    coldScore = std::numeric_limits<double>::max();
+    bool found = false;
+
+    for (uint64_t bank = 0; bank < numBanks; bank++) {
+        if (bank == sourceBank) {
+            continue;
+        }
+
+        for (uint64_t VRN = 0; VRN < numRegionsPerBank; VRN++) {
+            VirtualRegionLoc virt;
+            virt.channel = channel;
+            virt.rank = rank;
+            virt.bank = bank;
+            virt.vrn = VRN;
+
+            if (IsCoolingDown(virt)) {
+                continue;
+            }
+
+            PhysicalRegionLoc phys = regionMapper->GetPhysicalLocation(channel, rank, bank, VRN);
+            if (!regionMapper->IsFastRegion(phys)) {
+                continue;
+            }
+
+            if (phys.bank == sourcePhys.bank) {
+                continue;
+            }
+
+            uint64_t key = MakeKey(channel, rank, bank, VRN);
+            double score = regionScores[key];
+            if (score < coldScore) {
+                victimVirt = virt;
+                victimPhys = phys;
+                coldScore = score;
+                found = true;
+            }
+        }
+    }
+
+    return found;
+}
+
+MigrationCandidate ReRAMRegionController::BuildCandidate(const VirtualRegionLoc& sourceVirt,
+                                                         const PhysicalRegionLoc& sourcePhys,
+                                                         double hotScore,
+                                                         const VirtualRegionLoc& victimVirt,
+                                                         const PhysicalRegionLoc& victimPhys,
+                                                         double coldScore,
+                                                         bool interbank) const
+{
+    MigrationCandidate candidate = MakeInvalidCandidate();
+    double threshold = interbank ? interBankMigrationThreshold : migrationThreshold;
+    double weight = interbank ? interBankScoreWeight : intraBankScoreWeight;
+    double cost = interbank ? interBankMigrationCost : 0.0;
+    double rawBenefit = hotScore - coldScore;
+    double weightedBenefit = weight * rawBenefit - cost;
+
+    if (weightedBenefit < threshold) {
+        return candidate;
+    }
+
+    candidate.valid = true;
+    candidate.interbank = interbank;
+    candidate.sourceVirt = sourceVirt;
+    candidate.victimVirt = victimVirt;
+    candidate.sourcePhys = sourcePhys;
+    candidate.victimPhys = victimPhys;
+    candidate.hotScore = hotScore;
+    candidate.coldScore = coldScore;
+    candidate.rawBenefit = rawBenefit;
+    candidate.migrationCost = cost;
+    candidate.weightedBenefit = weightedBenefit;
+    return candidate;
+}
+
+MigrationCandidate ReRAMRegionController::ChooseMigrationCandidate(const MigrationCandidate& intra,
+                                                                   const MigrationCandidate& inter) const
+{
+    if (!intra.valid) {
+        return inter;
+    }
+    if (!inter.valid) {
+        return intra;
+    }
+
+    if (preferIntraBankOnTie && intra.weightedBenefit == inter.weightedBenefit) {
+        return intra;
+    }
+
+    return (inter.weightedBenefit > intra.weightedBenefit) ? inter : intra;
+}
+
+void ReRAMRegionController::Migration(uint64_t channel, uint64_t rank, uint64_t bank,
+                                      uint64_t& totalUsed, uint64_t& interbankUsed)
+{
     if (regionMapper == NULL) {
         std::cerr << "WARNING: Migration called but region mapper not set" << std::endl;
         return;
     }
 
-    // Step 1: Calculate scores for all regions
-    CalculateRegionScores(bank);
+    CalculateRegionScores(channel, rank, bank);
 
-    // Step 2: Check if migration threshold is met
-    uint64_t VRN_hot, VRN_cold_initial;
-    if (!CheckMigrationThreshold(bank, VRN_hot, VRN_cold_initial)) {
-        return;  // No migration needed
-    }
-
-    // Step 3: Find cold region currently in fast physical region
-    uint64_t VRN_cold = FindColdFastRegion(bank);
-
-    if (VRN_cold == VRN_hot) {
-        // Edge case: hot region is the only one being tracked
+    VirtualRegionLoc hotVirt;
+    PhysicalRegionLoc hotPhys;
+    double hotScore = 0.0;
+    if (!FindHotSlowRegion(channel, rank, bank, hotVirt, hotPhys, hotScore)) {
         return;
     }
 
-    // Step 4: Perform swap
-    regionMapper->SwapRegions(bank, VRN_hot, VRN_cold);
+    MigrationCandidate intra = MakeInvalidCandidate();
+    VirtualRegionLoc intraVictimVirt;
+    PhysicalRegionLoc intraVictimPhys;
+    double intraColdScore = 0.0;
+    if (FindColdFastRegionInBank(channel, rank, bank, hotPhys,
+                                 intraVictimVirt, intraVictimPhys, intraColdScore)) {
+        intra = BuildCandidate(hotVirt, hotPhys, hotScore,
+                               intraVictimVirt, intraVictimPhys, intraColdScore,
+                               false);
+    }
 
-    // Step 5: Update statistics
-    totalMigrations++;
-    migrationsPerBank[bank]++;
-
-    // Step 6: Halve all scores to emphasize recent behavior
-    HalveScores();
-
-    #ifdef DEBUG_REGION_CONTROLLER
-    uint64_t PRN_hot_new = regionMapper->GetPRN(bank, VRN_hot);
-    uint64_t PRN_cold_new = regionMapper->GetPRN(bank, VRN_cold);
-    std::cout << "Migration in bank " << bank << ":" << std::endl;
-    std::cout << "  Swapped VRN " << VRN_hot << " (score=" << regionScores[MakeKey(bank, VRN_hot)]
-              << ", now PRN=" << PRN_hot_new << ", fast=" << regionMapper->IsFastRegion(PRN_hot_new)
-              << ")" << std::endl;
-    std::cout << "     with VRN " << VRN_cold << " (score=" << regionScores[MakeKey(bank, VRN_cold)]
-              << ", now PRN=" << PRN_cold_new << ", fast=" << regionMapper->IsFastRegion(PRN_cold_new)
-              << ")" << std::endl;
-    #endif
-}
-
-uint64_t ReRAMRegionController::FindColdFastRegion(uint64_t bank)
-{
-    double minScore = std::numeric_limits<double>::max();
-    uint64_t coldestVRN = 0;
-    bool foundFast = false;
-
-    // Search for VRN mapped to fast region with lowest score
-    for (uint64_t VRN = 0; VRN < numRegionsPerBank; VRN++) {
-        // Get PRN for this VRN
-        uint64_t PRN = regionMapper->GetPRN(bank, VRN);
-
-        // Check if it's in a fast physical region
-        if (regionMapper->IsFastRegion(PRN)) {
-            foundFast = true;
-            uint64_t key = MakeKey(bank, VRN);
-            double score = regionScores[key];
-
-            if (score < minScore) {
-                minScore = score;
-                coldestVRN = VRN;
-            }
+    MigrationCandidate inter = MakeInvalidCandidate();
+    if (enableInterBankMigration && interbankUsed < maxInterBankMigrationsPerEpoch) {
+        interBankMigrationAttempts++;
+        VirtualRegionLoc interVictimVirt;
+        PhysicalRegionLoc interVictimPhys;
+        double interColdScore = 0.0;
+        if (FindColdFastRegionInRank(channel, rank, bank, hotPhys,
+                                     interVictimVirt, interVictimPhys, interColdScore)) {
+            inter = BuildCandidate(hotVirt, hotPhys, hotScore,
+                                   interVictimVirt, interVictimPhys, interColdScore,
+                                   true);
+        }
+        if (!inter.valid) {
+            interBankMigrationRejects++;
         }
     }
 
-    if (!foundFast) {
-        std::cerr << "WARNING: No fast region found in bank " << bank << std::endl;
+    MigrationCandidate best = ChooseMigrationCandidate(intra, inter);
+    if (!best.valid) {
+        return;
     }
 
-    return coldestVRN;
+    if (best.interbank && interbankUsed >= maxInterBankMigrationsPerEpoch) {
+        return;
+    }
+
+    if (!regionMapper->SwapRegions(best.sourceVirt, best.victimVirt)) {
+        return;
+    }
+
+    totalMigrations++;
+    totalUsed++;
+    if (best.sourceVirt.bank < 8) {
+        migrationsPerBank[best.sourceVirt.bank]++;
+    }
+    if (best.interbank) {
+        totalInterBankMigrations++;
+        interbankUsed++;
+    } else {
+        totalIntraBankMigrations++;
+    }
+
+    uint64_t sourceKey = MakeKey(best.sourceVirt.channel, best.sourceVirt.rank,
+                                 best.sourceVirt.bank, best.sourceVirt.vrn);
+    uint64_t victimKey = MakeKey(best.victimVirt.channel, best.victimVirt.rank,
+                                 best.victimVirt.bank, best.victimVirt.vrn);
+    lastMigrationEpoch[sourceKey] = totalEpochs;
+    lastMigrationEpoch[victimKey] = totalEpochs;
+
+    if (best.rawBenefit > maxScoreDifference) {
+        maxScoreDifference = best.rawBenefit;
+    }
+    avgScoreDifference = (avgScoreDifference * (totalMigrations - 1) + best.rawBenefit)
+                         / totalMigrations;
+
+    HalveScores();
 }
 
 void ReRAMRegionController::HalveScores()
 {
-    // Halve all write scores
-    for (auto &entry : writeScores) {
-        entry.second = entry.second / 2;
+    for (std::map<uint64_t, uint64_t>::iterator it = writeScores.begin();
+         it != writeScores.end(); ++it) {
+        it->second = it->second / 2;
     }
 
-    // Halve all read scores
-    for (auto &entry : readScores) {
-        entry.second = entry.second / 2;
+    for (std::map<uint64_t, uint64_t>::iterator it = readScores.begin();
+         it != readScores.end(); ++it) {
+        it->second = it->second / 2;
     }
 
-    // Clear region scores (will be recalculated next epoch)
     regionScores.clear();
 }
 
@@ -398,6 +588,11 @@ void ReRAMRegionController::RegisterStats()
     }
     AddStat(hotAccessesToFast);
     AddStat(hotAccessesToSlow);
+    AddStat(totalInterBankMigrations);
+    AddStat(totalIntraBankMigrations);
+    AddStat(interBankMigrationAttempts);
+    AddStat(interBankMigrationRejects);
+    AddStat(cooldownBlockedMigrations);
 }
 
 void ReRAMRegionController::CalculateStats()
@@ -407,6 +602,11 @@ void ReRAMRegionController::CalculateStats()
     std::cout << "\nReRAMRegionController Statistics:" << std::endl;
     std::cout << "  Total epochs: " << totalEpochs << std::endl;
     std::cout << "  Total migrations: " << totalMigrations << std::endl;
+    std::cout << "  Intrabank migrations: " << totalIntraBankMigrations << std::endl;
+    std::cout << "  Interbank migrations: " << totalInterBankMigrations << std::endl;
+    std::cout << "  Interbank migration attempts: " << interBankMigrationAttempts << std::endl;
+    std::cout << "  Interbank migration rejects: " << interBankMigrationRejects << std::endl;
+    std::cout << "  Cooldown blocks: " << cooldownBlockedMigrations << std::endl;
 
     if (totalEpochs > 0) {
         std::cout << "  Migrations per epoch: "
@@ -414,7 +614,7 @@ void ReRAMRegionController::CalculateStats()
     }
 
     std::cout << "  Per-bank migrations:" << std::endl;
-    for (uint64_t i = 0; i < numBanks; i++) {
+    for (uint64_t i = 0; i < numBanks && i < 8; i++) {
         std::cout << "    Bank " << i << ": " << migrationsPerBank[i] << std::endl;
     }
 

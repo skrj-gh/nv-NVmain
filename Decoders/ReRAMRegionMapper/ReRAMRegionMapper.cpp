@@ -39,13 +39,13 @@ using namespace NVM;
 ReRAMRegionMapper::ReRAMRegionMapper()
     : AddressTranslator()
 {
-    // Initialize statistics counters
     regionSwaps = 0;
     fastRegionAccesses = 0;
     slowRegionAccesses = 0;
     totalTranslations = 0;
 
-    // Default configuration values (will be overridden by SetConfig)
+    numChannels = 1;
+    numRanks = 1;
     regionSize = 64;
     numRegionsPerBank = 1024;
     numRegionsPerMat = 16;
@@ -58,17 +58,20 @@ ReRAMRegionMapper::ReRAMRegionMapper()
 
 ReRAMRegionMapper::~ReRAMRegionMapper()
 {
-    // Clear region tables
     regionTable.clear();
     inverseRegionTable.clear();
 }
 
 void ReRAMRegionMapper::SetConfig(Config *config, bool createChildren)
 {
-    // Call parent SetConfig first
     AddressTranslator::SetConfig(config, createChildren);
 
-    // Read configuration parameters
+    if (config->KeyExists("CHANNELS"))
+        numChannels = config->GetValue("CHANNELS");
+
+    if (config->KeyExists("RANKS"))
+        numRanks = config->GetValue("RANKS");
+
     if (config->KeyExists("BANKS"))
         numBanks = config->GetValue("BANKS");
 
@@ -81,19 +84,17 @@ void ReRAMRegionMapper::SetConfig(Config *config, bool createChildren)
     if (config->KeyExists("RegionSize"))
         regionSize = config->GetValue("RegionSize");
     else
-        regionSize = 64; // Default: 64 rows per region
+        regionSize = 64;
 
     if (config->KeyExists("FastRegionsPerMat"))
         fastRegionsPerMat = config->GetValue("FastRegionsPerMat");
     else
-        fastRegionsPerMat = 4; // Default: 25% fast regions
+        fastRegionsPerMat = 4;
 
-    // Calculate derived parameters
     numMats = numRows / matHeight;
     numRegionsPerBank = numRows / regionSize;
     numRegionsPerMat = matHeight / regionSize;
 
-    // Validation checks
     assert(regionSize > 0 && "RegionSize must be positive");
     assert((regionSize & (regionSize - 1)) == 0 && "RegionSize must be power of 2");
     assert(numRows % regionSize == 0 && "ROWS must be divisible by RegionSize");
@@ -101,12 +102,12 @@ void ReRAMRegionMapper::SetConfig(Config *config, bool createChildren)
     assert(fastRegionsPerMat <= numRegionsPerMat &&
            "FastRegionsPerMat cannot exceed total regions per mat");
 
-    // Initialize region tables with identity mapping
     InitializeRegionTable();
 
-    // Print configuration summary
     std::cout << "ReRAMRegionMapper Configuration:" << std::endl;
-    std::cout << "  Banks: " << numBanks << std::endl;
+    std::cout << "  Channels: " << numChannels << std::endl;
+    std::cout << "  Ranks per channel: " << numRanks << std::endl;
+    std::cout << "  Banks per rank: " << numBanks << std::endl;
     std::cout << "  Rows per bank: " << numRows << std::endl;
     std::cout << "  Mat height: " << matHeight << std::endl;
     std::cout << "  Mats per bank: " << numMats << std::endl;
@@ -116,26 +117,31 @@ void ReRAMRegionMapper::SetConfig(Config *config, bool createChildren)
     std::cout << "  Fast regions per mat: " << fastRegionsPerMat
               << " (" << (fastRegionsPerMat * 100 / numRegionsPerMat) << "%)" << std::endl;
     std::cout << "  Total fast regions per bank: " << (numMats * fastRegionsPerMat) << std::endl;
-    std::cout << "  Region table size: " << (numBanks * numRegionsPerBank)
-              << " entries (~" << (numBanks * numRegionsPerBank * 10 / 8192) << " KB)" << std::endl;
+    std::cout << "  Region table size: "
+              << (numChannels * numRanks * numBanks * numRegionsPerBank)
+              << " entries" << std::endl;
 }
 
 void ReRAMRegionMapper::InitializeRegionTable()
 {
-    // Initialize with identity mapping: VRN → VRN (no translation initially)
-    for (uint64_t bank = 0; bank < numBanks; bank++) {
-        for (uint64_t VRN = 0; VRN < numRegionsPerBank; VRN++) {
-            uint64_t key = MakeKey(bank, VRN);
+    regionTable.clear();
+    inverseRegionTable.clear();
 
-            // Forward table: VRN → PRN (identity: PRN = VRN initially)
-            regionTable[key] = VRN;
-
-            // Inverse table: PRN → VRN (identity: VRN = PRN initially)
-            inverseRegionTable[key] = VRN;
+    for (uint64_t channel = 0; channel < numChannels; channel++) {
+        for (uint64_t rank = 0; rank < numRanks; rank++) {
+            for (uint64_t bank = 0; bank < numBanks; bank++) {
+                for (uint64_t VRN = 0; VRN < numRegionsPerBank; VRN++) {
+                    regionTable[MakeVirtualKey(channel, rank, bank, VRN)] =
+                        MakePhysicalRegionLoc(channel, rank, bank, VRN);
+                    inverseRegionTable[MakePhysicalKey(channel, rank, bank, VRN)] =
+                        MakeVirtualRegionLoc(channel, rank, bank, VRN);
+                }
+            }
         }
     }
 
-    std::cout << "ReRAMRegionMapper: Initialized " << (numBanks * numRegionsPerBank)
+    std::cout << "ReRAMRegionMapper: Initialized "
+              << (numChannels * numRanks * numBanks * numRegionsPerBank)
               << " region mappings (identity)" << std::endl;
 }
 
@@ -144,144 +150,125 @@ void ReRAMRegionMapper::Translate(uint64_t address,
                                    uint64_t *bank, uint64_t *rank,
                                    uint64_t *channel, uint64_t *subarray)
 {
-    // Step 1: Call parent to perform standard address decomposition
-    // This extracts channel, rank, bank, column, and VRA (in *row)
     AddressTranslator::Translate(address, row, col, bank, rank, channel, subarray);
 
-    // Step 2: Extract Virtual Row Address (VRA) from row field
+    uint64_t virtChannel = *channel;
+    uint64_t virtRank = *rank;
+    uint64_t virtBank = *bank;
     uint64_t VRA = *row;
+    uint64_t VRN = GetVRN(VRA);
+    uint64_t RO = GetRegionOffset(VRA);
 
-    // Step 3: Split VRA into Virtual Region Number (VRN) and Region Offset (RO)
-    uint64_t VRN = GetVRN(VRA);      // Top 10 bits: VRA >> 6
-    uint64_t RO = GetRegionOffset(VRA);  // Bottom 6 bits: VRA & 0x3F
+    PhysicalRegionLoc phys = GetPhysicalLocation(virtChannel, virtRank, virtBank, VRN);
+    uint64_t PRA = GetPRA(phys.prn, RO);
 
-    // Step 4: Lookup Region Table to get Physical Region Number (PRN)
-    uint64_t key = MakeKey(*bank, VRN);
-    uint64_t PRN;
-
-    auto it = regionTable.find(key);
-    if (it != regionTable.end()) {
-        PRN = it->second;
-    } else {
-        // If not found (shouldn't happen with proper initialization), use identity
-        PRN = VRN;
-        std::cerr << "WARNING: ReRAMRegionMapper: Region table lookup failed for "
-                  << "bank=" << *bank << ", VRN=" << VRN << ". Using identity mapping."
-                  << std::endl;
-    }
-
-    // Step 5: Reconstruct Physical Row Address (PRA)
-    uint64_t PRA = GetPRA(PRN, RO);  // (PRN << 6) | RO
-
-    // Step 6: Update row with translated address
+    *channel = phys.channel;
+    *rank = phys.rank;
+    *bank = phys.bank;
     *row = PRA;
-
-    // Step 7: Update subarray (mat index) based on PRA
-    // Mat index = top 6 bits of PRA
     *subarray = PRA >> MAT_SHIFT;
 
-    // Step 8: Update statistics
     totalTranslations++;
-    if (IsFastRegion(PRN)) {
+    if (IsFastRegion(phys)) {
         fastRegionAccesses++;
     } else {
         slowRegionAccesses++;
     }
 }
 
-void ReRAMRegionMapper::SwapRegions(uint64_t bank, uint64_t VRN_hot, uint64_t VRN_cold)
+bool ReRAMRegionMapper::SwapRegions(const VirtualRegionLoc& source,
+                                    const VirtualRegionLoc& victim)
 {
-    // Validate inputs
-    assert(bank < numBanks && "Invalid bank ID");
-    assert(VRN_hot < numRegionsPerBank && "Invalid VRN_hot");
-    assert(VRN_cold < numRegionsPerBank && "Invalid VRN_cold");
-    assert(VRN_hot != VRN_cold && "Cannot swap region with itself");
+    assert(source.channel < numChannels && victim.channel < numChannels);
+    assert(source.rank < numRanks && victim.rank < numRanks);
+    assert(source.bank < numBanks && victim.bank < numBanks);
+    assert(source.vrn < numRegionsPerBank && victim.vrn < numRegionsPerBank);
 
-    // Generate keys for region table lookup
-    uint64_t key_hot = MakeKey(bank, VRN_hot);
-    uint64_t key_cold = MakeKey(bank, VRN_cold);
+    if (source.channel != victim.channel || source.rank != victim.rank) {
+        return false;
+    }
 
-    // Get current Physical Region Numbers for both virtual regions
-    uint64_t PRN_hot = regionTable[key_hot];
-    uint64_t PRN_cold = regionTable[key_cold];
+    if (source.bank == victim.bank && source.vrn == victim.vrn) {
+        return false;
+    }
 
-    // Swap forward mappings: VRN → PRN
-    regionTable[key_hot] = PRN_cold;   // Hot VRN now maps to cold's physical region
-    regionTable[key_cold] = PRN_hot;   // Cold VRN now maps to hot's physical region
+    uint64_t sourceKey = MakeVirtualKey(source.channel, source.rank, source.bank, source.vrn);
+    uint64_t victimKey = MakeVirtualKey(victim.channel, victim.rank, victim.bank, victim.vrn);
 
-    // Update inverse mappings: PRN → VRN
-    uint64_t inv_key_hot = MakeKey(bank, PRN_hot);
-    uint64_t inv_key_cold = MakeKey(bank, PRN_cold);
-    inverseRegionTable[inv_key_hot] = VRN_cold;
-    inverseRegionTable[inv_key_cold] = VRN_hot;
+    PhysicalRegionLoc sourcePhys = regionTable[sourceKey];
+    PhysicalRegionLoc victimPhys = regionTable[victimKey];
 
-    // Update statistics
+    regionTable[sourceKey] = victimPhys;
+    regionTable[victimKey] = sourcePhys;
+
+    inverseRegionTable[MakePhysicalKey(sourcePhys.channel, sourcePhys.rank,
+                                       sourcePhys.bank, sourcePhys.prn)] = victim;
+    inverseRegionTable[MakePhysicalKey(victimPhys.channel, victimPhys.rank,
+                                       victimPhys.bank, victimPhys.prn)] = source;
+
     regionSwaps++;
 
-    // Debug output (can be disabled in production)
     #ifdef DEBUG_REGION_MAPPER
-    std::cout << "ReRAMRegionMapper: Swapped regions in bank " << bank << ":" << std::endl;
-    std::cout << "  VRN " << VRN_hot << " (hot): PRN " << PRN_hot << " → " << PRN_cold
-              << " (fast=" << IsFastRegion(PRN_cold) << ")" << std::endl;
-    std::cout << "  VRN " << VRN_cold << " (cold): PRN " << PRN_cold << " → " << PRN_hot
-              << " (fast=" << IsFastRegion(PRN_hot) << ")" << std::endl;
+    std::cout << "ReRAMRegionMapper: Swapped regions within channel " << source.channel
+              << ", rank " << source.rank << std::endl;
     #endif
+
+    return true;
 }
 
-bool ReRAMRegionMapper::IsFastRegion(uint64_t PRN) const
+bool ReRAMRegionMapper::IsFastRegion(uint64_t channel, uint64_t rank,
+                                     uint64_t bank, uint64_t PRN) const
 {
-    // Decompose PRN into mat index and region within mat
-    // PRN range: 0-1023 (1024 total regions per bank)
-    // With 64 mats per bank: 16 regions per mat
-
-    uint64_t regionInMat = PRN % numRegionsPerMat;  // PRN % 16
-
-    // First fastRegionsPerMat regions in each mat are fast (near wordline driver)
-    // Example with fastRegionsPerMat = 4:
-    //   Mat 0: PRN 0-3 → fast,    PRN 4-15 → slow
-    //   Mat 1: PRN 16-19 → fast,  PRN 20-31 → slow
-    //   Mat 2: PRN 32-35 → fast,  PRN 36-47 → slow
-    //   etc.
-
+    (void)channel;
+    (void)rank;
+    (void)bank;
+    uint64_t regionInMat = PRN % numRegionsPerMat;
     return (regionInMat < fastRegionsPerMat);
 }
 
-uint64_t ReRAMRegionMapper::GetVRNFromPRN(uint64_t bank, uint64_t PRN) const
+bool ReRAMRegionMapper::IsFastRegion(const PhysicalRegionLoc& loc) const
 {
-    assert(bank < numBanks && "Invalid bank ID");
-    assert(PRN < numRegionsPerBank && "Invalid PRN");
-
-    uint64_t key = MakeKey(bank, PRN);
-
-    auto it = inverseRegionTable.find(key);
-    if (it != inverseRegionTable.end()) {
-        return it->second;
-    } else {
-        // If not found, use identity (shouldn't happen with proper initialization)
-        std::cerr << "WARNING: ReRAMRegionMapper: Inverse lookup failed for "
-                  << "bank=" << bank << ", PRN=" << PRN << ". Using identity mapping."
-                  << std::endl;
-        return PRN;
-    }
+    return IsFastRegion(loc.channel, loc.rank, loc.bank, loc.prn);
 }
 
-uint64_t ReRAMRegionMapper::GetPRN(uint64_t bank, uint64_t VRN) const
+VirtualRegionLoc ReRAMRegionMapper::GetVirtualOwner(uint64_t channel, uint64_t rank,
+                                                    uint64_t bank, uint64_t PRN) const
 {
-    assert(bank < numBanks && "Invalid bank ID");
+    assert(channel < numChannels && rank < numRanks && bank < numBanks);
+    assert(PRN < numRegionsPerBank && "Invalid PRN");
+
+    uint64_t key = MakePhysicalKey(channel, rank, bank, PRN);
+    std::map<uint64_t, VirtualRegionLoc>::const_iterator it = inverseRegionTable.find(key);
+
+    if (it != inverseRegionTable.end()) {
+        return it->second;
+    }
+
+    std::cerr << "WARNING: ReRAMRegionMapper: Inverse lookup failed for "
+              << "channel=" << channel << ", rank=" << rank
+              << ", bank=" << bank << ", PRN=" << PRN
+              << ". Using identity mapping." << std::endl;
+    return MakeVirtualRegionLoc(channel, rank, bank, PRN);
+}
+
+PhysicalRegionLoc ReRAMRegionMapper::GetPhysicalLocation(uint64_t channel, uint64_t rank,
+                                                         uint64_t bank, uint64_t VRN) const
+{
+    assert(channel < numChannels && rank < numRanks && bank < numBanks);
     assert(VRN < numRegionsPerBank && "Invalid VRN");
 
-    uint64_t key = MakeKey(bank, VRN);
+    uint64_t key = MakeVirtualKey(channel, rank, bank, VRN);
+    std::map<uint64_t, PhysicalRegionLoc>::const_iterator it = regionTable.find(key);
 
-    auto it = regionTable.find(key);
     if (it != regionTable.end()) {
         return it->second;
-    } else {
-        // If not found, use identity
-        std::cerr << "WARNING: ReRAMRegionMapper: Region lookup failed for "
-                  << "bank=" << bank << ", VRN=" << VRN << ". Using identity mapping."
-                  << std::endl;
-        return VRN;
     }
+
+    std::cerr << "WARNING: ReRAMRegionMapper: Region lookup failed for "
+              << "channel=" << channel << ", rank=" << rank
+              << ", bank=" << bank << ", VRN=" << VRN
+              << ". Using identity mapping." << std::endl;
+    return MakePhysicalRegionLoc(channel, rank, bank, VRN);
 }
 
 void ReRAMRegionMapper::RegisterStats()
@@ -296,7 +283,6 @@ void ReRAMRegionMapper::RegisterStats()
 
 void ReRAMRegionMapper::CalculateStats()
 {
-    // Calculate fast/slow region access ratio
     if (totalTranslations > 0) {
         double fastRatio = (double)fastRegionAccesses / totalTranslations;
         double slowRatio = (double)slowRegionAccesses / totalTranslations;
@@ -323,21 +309,23 @@ void ReRAMRegionMapper::CreateCheckpoint(std::string dir)
         return;
     }
 
-    // Write configuration parameters
+    checkpoint.write(reinterpret_cast<const char*>(&numChannels), sizeof(numChannels));
+    checkpoint.write(reinterpret_cast<const char*>(&numRanks), sizeof(numRanks));
     checkpoint.write(reinterpret_cast<const char*>(&numBanks), sizeof(numBanks));
     checkpoint.write(reinterpret_cast<const char*>(&numRegionsPerBank), sizeof(numRegionsPerBank));
 
-    // Write region table size
     uint64_t tableSize = regionTable.size();
     checkpoint.write(reinterpret_cast<const char*>(&tableSize), sizeof(tableSize));
 
-    // Write region table entries
-    for (const auto& entry : regionTable) {
-        checkpoint.write(reinterpret_cast<const char*>(&entry.first), sizeof(entry.first));
-        checkpoint.write(reinterpret_cast<const char*>(&entry.second), sizeof(entry.second));
+    for (std::map<uint64_t, PhysicalRegionLoc>::const_iterator it = regionTable.begin();
+         it != regionTable.end(); ++it) {
+        checkpoint.write(reinterpret_cast<const char*>(&it->first), sizeof(it->first));
+        checkpoint.write(reinterpret_cast<const char*>(&it->second.channel), sizeof(it->second.channel));
+        checkpoint.write(reinterpret_cast<const char*>(&it->second.rank), sizeof(it->second.rank));
+        checkpoint.write(reinterpret_cast<const char*>(&it->second.bank), sizeof(it->second.bank));
+        checkpoint.write(reinterpret_cast<const char*>(&it->second.prn), sizeof(it->second.prn));
     }
 
-    // Write statistics
     checkpoint.write(reinterpret_cast<const char*>(&regionSwaps), sizeof(regionSwaps));
     checkpoint.write(reinterpret_cast<const char*>(&fastRegionAccesses), sizeof(fastRegionAccesses));
     checkpoint.write(reinterpret_cast<const char*>(&slowRegionAccesses), sizeof(slowRegionAccesses));
@@ -357,44 +345,46 @@ void ReRAMRegionMapper::RestoreCheckpoint(std::string dir)
         return;
     }
 
-    // Read configuration parameters
-    uint64_t savedNumBanks, savedNumRegionsPerBank;
+    uint64_t savedNumChannels, savedNumRanks, savedNumBanks, savedNumRegionsPerBank;
+    checkpoint.read(reinterpret_cast<char*>(&savedNumChannels), sizeof(savedNumChannels));
+    checkpoint.read(reinterpret_cast<char*>(&savedNumRanks), sizeof(savedNumRanks));
     checkpoint.read(reinterpret_cast<char*>(&savedNumBanks), sizeof(savedNumBanks));
     checkpoint.read(reinterpret_cast<char*>(&savedNumRegionsPerBank), sizeof(savedNumRegionsPerBank));
 
-    // Validate configuration matches
-    if (savedNumBanks != numBanks || savedNumRegionsPerBank != numRegionsPerBank) {
+    if (savedNumChannels != numChannels || savedNumRanks != numRanks ||
+        savedNumBanks != numBanks || savedNumRegionsPerBank != numRegionsPerBank) {
         std::cerr << "ERROR: Checkpoint configuration mismatch!" << std::endl;
-        std::cerr << "  Expected: banks=" << numBanks << ", regions=" << numRegionsPerBank << std::endl;
-        std::cerr << "  Found: banks=" << savedNumBanks << ", regions=" << savedNumRegionsPerBank << std::endl;
         checkpoint.close();
         return;
     }
 
-    // Clear existing tables
     regionTable.clear();
     inverseRegionTable.clear();
 
-    // Read region table size
     uint64_t tableSize;
     checkpoint.read(reinterpret_cast<char*>(&tableSize), sizeof(tableSize));
 
-    // Read region table entries
     for (uint64_t i = 0; i < tableSize; i++) {
-        uint64_t key, value;
+        uint64_t key;
+        PhysicalRegionLoc value;
         checkpoint.read(reinterpret_cast<char*>(&key), sizeof(key));
-        checkpoint.read(reinterpret_cast<char*>(&value), sizeof(value));
+        checkpoint.read(reinterpret_cast<char*>(&value.channel), sizeof(value.channel));
+        checkpoint.read(reinterpret_cast<char*>(&value.rank), sizeof(value.rank));
+        checkpoint.read(reinterpret_cast<char*>(&value.bank), sizeof(value.bank));
+        checkpoint.read(reinterpret_cast<char*>(&value.prn), sizeof(value.prn));
         regionTable[key] = value;
 
-        // Rebuild inverse table
-        uint64_t bank = key >> 10;
-        uint64_t VRN = key & 0x3FF;
-        uint64_t PRN = value;
-        uint64_t inv_key = MakeKey(bank, PRN);
-        inverseRegionTable[inv_key] = VRN;
+        uint64_t regionIndex = key % numRegionsPerBank;
+        uint64_t container = key / numRegionsPerBank;
+        uint64_t bank = container % numBanks;
+        container /= numBanks;
+        uint64_t rank = container % numRanks;
+        uint64_t channel = container / numRanks;
+
+        inverseRegionTable[MakePhysicalKey(value.channel, value.rank, value.bank, value.prn)] =
+            MakeVirtualRegionLoc(channel, rank, bank, regionIndex);
     }
 
-    // Read statistics
     checkpoint.read(reinterpret_cast<char*>(&regionSwaps), sizeof(regionSwaps));
     checkpoint.read(reinterpret_cast<char*>(&fastRegionAccesses), sizeof(fastRegionAccesses));
     checkpoint.read(reinterpret_cast<char*>(&slowRegionAccesses), sizeof(slowRegionAccesses));
