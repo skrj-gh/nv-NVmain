@@ -283,6 +283,13 @@ void ReRAMRegionController::CalculateRegionScores(uint64_t channel, uint64_t ran
     }
 }
 
+void ReRAMRegionController::CalculateRegionScoresForRank(uint64_t channel, uint64_t rank)
+{
+    for (uint64_t bank = 0; bank < numBanks; bank++) {
+        CalculateRegionScores(channel, rank, bank);
+    }
+}
+
 bool ReRAMRegionController::IsCoolingDown(const VirtualRegionLoc& loc) const
 {
     if (interBankCooldownEpochs == 0) {
@@ -484,7 +491,12 @@ void ReRAMRegionController::Migration(uint64_t channel, uint64_t rank, uint64_t 
         return;
     }
 
-    CalculateRegionScores(channel, rank, bank);
+    /*
+     * Interbank candidate search compares against victim regions in other banks.
+     * Refresh score snapshots for the whole rank to avoid using stale/empty
+     * regionScores entries outside the source bank.
+     */
+    CalculateRegionScoresForRank(channel, rank);
 
     VirtualRegionLoc hotVirt;
     PhysicalRegionLoc hotPhys;

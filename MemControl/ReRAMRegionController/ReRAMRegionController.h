@@ -107,6 +107,7 @@ class ReRAMRegionController : public FRFCFS
 
     void UpdateRegionScores(NVMainRequest *req);
     void CalculateRegionScores(uint64_t channel, uint64_t rank, uint64_t bank);
+    void CalculateRegionScoresForRank(uint64_t channel, uint64_t rank);
     void Migration(uint64_t channel, uint64_t rank, uint64_t bank,
                    uint64_t& totalUsed, uint64_t& interbankUsed);
     void HalveScores();
